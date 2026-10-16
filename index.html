@@ -1,0 +1,920 @@
+
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Angry Rabbits - 50 Levels</title>
+<style>
+  * { box-sizing: border-box; }
+  body {
+    margin: 0;
+    background: #172c3b;
+    color: white;
+    font-family: Arial, sans-serif;
+    text-align: center;
+  }
+  header { padding: 12px 8px 6px; }
+  h1 { margin: 0 0 6px; font-size: clamp(24px, 4vw, 36px); }
+  #info { margin: 6px; font-size: 15px; }
+  #game-wrap {
+    width: min(100%, 1100px);
+    margin: auto;
+    padding: 6px;
+  }
+  canvas {
+    display: block;
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    background: #91d7f5;
+    border: 3px solid #fff;
+    border-radius: 10px;
+    touch-action: none;
+  }
+  .controls {
+    display: flex;
+    flex-wrap: wrap;
+    justify-content: center;
+    gap: 9px;
+    padding: 12px 5px;
+  }
+  button {
+    border: 0;
+    border-radius: 9px;
+    padding: 11px 17px;
+    font-size: 15px;
+    font-weight: bold;
+    background: #ffb52e;
+    color: #282018;
+    cursor: pointer;
+  }
+  button:hover { filter: brightness(1.08); }
+  button:active { transform: scale(.97); }
+  #message { min-height: 24px; padding: 0 10px 8px; }
+  .help { color: #d9e8f2; font-size: 13px; padding: 0 12px 15px; }
+</style>
+</head>
+<body>
+<header>
+  <h1>🐰 Angry Rabbits 🥕</h1>
+  <div id="info">Level 1 of 50 | Hawks remaining: 0</div>
+</header>
+
+<div id="game-wrap">
+  <canvas id="game" width="960" height="540"></canvas>
+  <div class="controls">
+    <button id="reset">↻ Restart Level</button>
+    <button id="next" hidden>Next Level ➜</button>
+    <button id="sound">🔊 Sound: On</button>
+  </div>
+  <div id="message">Pull the rabbit back, then release to launch!</div>
+  <div class="help">
+    Drag the rabbit backward to aim. Blocks have invisible collision hitboxes,
+    bounce off one another, and can topple whole towers.
+  </div>
+</div>
+
+<script>
+(() => {
+"use strict";
+
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+const info = document.getElementById("info");
+const message = document.getElementById("message");
+const nextButton = document.getElementById("next");
+const resetButton = document.getElementById("reset");
+const soundButton = document.getElementById("sound");
+
+const W = canvas.width;
+const H = canvas.height;
+const GROUND = 465;
+const GRAVITY = 650;
+const POWER = 5.5;
+const MAX_PULL = 75;
+const TOTAL_LEVELS = 50;
+
+let level = 1;
+let blocks = [];
+let hawks = [];
+let particles = [];
+let rabbit;
+let launched = false;
+let dragging = false;
+let pointer = {x: 0, y: 0};
+let aimPoint = {x: 145, y: 370};
+let shotsLeft = 3;
+let won = false;
+let lost = false;
+let soundOn = true;
+let lastTime = 0;
+let elapsed = 0;
+let speechTimer = 0;
+let shake = 0;
+let audioContext = null;
+
+const sling = {x: 145, y: 370};
+const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+const rand = (a, b) => a + Math.random() * (b-a);
+
+function beep(freq = 180, duration = .07, type = "sine", volume = .035) {
+  if (!soundOn) return;
+  try {
+    audioContext ||= new (window.AudioContext || window.webkitAudioContext)();
+    const oscillator = audioContext.createOscillator();
+    const gain = audioContext.createGain();
+    oscillator.type = type;
+    oscillator.frequency.value = freq;
+    gain.gain.value = volume;
+    gain.gain.exponentialRampToValueAtTime(.001, audioContext.currentTime + duration);
+    oscillator.connect(gain);
+    gain.connect(audioContext.destination);
+    oscillator.start();
+    oscillator.stop(audioContext.currentTime + duration);
+  } catch (_) {}
+}
+
+function makeBlock(x, y, w, h, kind = "wood") {
+  return {
+    x, y, w, h,
+    vx: 0, vy: 0,
+    angle: 0, av: 0,
+    kind,
+    mass: Math.max(1, w*h/700),
+    alive: true,
+    sleep: 0,
+    hitbox: {invisible: true}
+  };
+}
+
+function makeHawk(x, y) {
+  return {
+    x, y, r: 15,
+    vx: 0, vy: 0,
+    alive: true,
+    grounded: false,
+    flap: Math.random()*6
+  };
+}
+
+function addTower(center, width, storeys, seed) {
+  const floorY = GROUND;
+  const sideW = 17;
+  const gap = 34;
+  const storeyH = 51 + (seed % 3) * 3;
+  const baseY = floorY - 5;
+
+  // Each level uses a different layout while keeping a three-storey tower.
+  for (let i = 0; i < storeys; i++) {
+    const y = baseY - (i+1)*storeyH;
+    const x1 = center - width/2;
+    const x2 = center + width/2 - sideW;
+
+    blocks.push(makeBlock(x1 + sideW/2, y + storeyH/2,
+      sideW, storeyH, "wood"));
+    blocks.push(makeBlock(x2 + sideW/2, y + storeyH/2,
+      sideW, storeyH, "wood"));
+
+    // Split beams create openings for hawks.
+    const opening = gap + ((seed + i) % 3) * 10;
+    const beamW = (width - 2*sideW - opening)/2;
+    if (beamW > 12) {
+      blocks.push(makeBlock(
+        center - opening/2 - beamW/2,
+        y + storeyH - 7,
+        beamW, 14, "beam"
+      ));
+      blocks.push(makeBlock(
+        center + opening/2 + beamW/2,
+        y + storeyH - 7,
+        beamW, 14, "beam"
+      ));
+    }
+
+    if ((i + seed) % 2 === 0 || i === 1) {
+      hawks.push(makeHawk(center + ((seed % 3)-1)*4, y + storeyH/2));
+    }
+  }
+
+  // Top cap: a slightly different shape on each level.
+  const topY = baseY - storeys*storeyH;
+  if (seed % 3 === 0) {
+    blocks.push(makeBlock(center, topY + 5, width*.7, 12, "beam"));
+  } else {
+    blocks.push(makeBlock(center, topY + 5, width*.48, 12, "beam"));
+    if (seed % 3 === 2) {
+      blocks.push(makeBlock(center, topY - 18, width*.3, 11, "beam"));
+    }
+  }
+}
+
+function createLevel(n) {
+  blocks = [];
+  hawks = [];
+  particles = [];
+  launched = false;
+  dragging = false;
+  won = false;
+  lost = false;
+  shotsLeft = 3;
+  elapsed = 0;
+  speechTimer = 0;
+  shake = 0;
+  nextButton.hidden = true;
+
+  // All levels use a shared playfield but have varying tower positions,
+  // widths, storey heights, and extra obstacles.
+  const count = 2 + ((n + Math.floor(n/4)) % 3);
+  const leftEdge = 405;
+  const rightEdge = 900;
+  const usable = rightEdge - leftEdge;
+  const slot = usable / count;
+
+  for (let i = 0; i < count; i++) {
+    const seed = n*7 + i*11;
+    const center = leftEdge + slot*(i+.5);
+    const width = Math.min(105, slot*(.62 + (seed%3)*.06));
+    const storeys = 3;
+
+    addTower(center, width, storeys, seed);
+
+    // Add different extra pieces to make each level feel different.
+    if ((n+i)%3 === 0) {
+      blocks.push(makeBlock(center, GROUND-12, width*.75, 13, "beam"));
+    }
+    if ((n+i)%4 === 1) {
+      blocks.push(makeBlock(center+width*.18, GROUND-125, 13, 24, "wood"));
+    }
+    if ((n+i)%5 === 2) {
+      blocks.push(makeBlock(center-width*.17, GROUND-190, 13, 24, "wood"));
+    }
+  }
+
+  rabbit = {
+    x: sling.x, y: sling.y,
+    r: 16, vx: 0, vy: 0,
+    alive: true, grounded: false
+  };
+  aimPoint = {x: sling.x, y: sling.y};
+  updateInfo();
+  message.textContent = `Level ${n}: knock down the towers and clear the hawks!`;
+}
+
+function updateInfo() {
+  const remaining = hawks.filter(h => h.alive).length;
+  info.textContent = `Level ${level} of ${TOTAL_LEVELS} | Hawks remaining: ${remaining} | Rabbits: ${shotsLeft}`;
+}
+
+function nextLevel() {
+  if (!won) return;
+  if (level >= TOTAL_LEVELS) {
+    level = 1;
+    message.textContent = "You beat all 50 levels! Starting again!";
+  } else {
+    level++;
+    message.textContent = `Level ${level} — new tower arrangement!`;
+  }
+  createLevel(level);
+}
+
+function restart() {
+  createLevel(level);
+}
+
+function getPointer(e) {
+  const rect = canvas.getBoundingClientRect();
+  return {
+    x: (e.clientX - rect.left) * W / rect.width,
+    y: (e.clientY - rect.top) * H / rect.height
+  };
+}
+
+canvas.addEventListener("pointerdown", e => {
+  const p = getPointer(e);
+  pointer = p;
+  if (!launched && !won && !lost &&
+      Math.hypot(p.x-rabbit.x, p.y-rabbit.y) < 38) {
+    dragging = true;
+    canvas.setPointerCapture(e.pointerId);
+    e.preventDefault();
+  }
+});
+
+canvas.addEventListener("pointermove", e => {
+  pointer = getPointer(e);
+  if (dragging) {
+    let dx = pointer.x - sling.x;
+    let dy = pointer.y - sling.y;
+    const d = Math.hypot(dx,dy);
+    if (d > MAX_PULL) {
+      dx = dx/d*MAX_PULL;
+      dy = dy/d*MAX_PULL;
+    }
+    // Pull mainly backward, but allow vertical aiming.
+    rabbit.x = clamp(sling.x + dx, sling.x-MAX_PULL, sling.x+12);
+    rabbit.y = clamp(sling.y + dy, sling.y-MAX_PULL, sling.y+MAX_PULL);
+    aimPoint = {x:rabbit.x,y:rabbit.y};
+  }
+});
+
+function releaseRabbit() {
+  if (!dragging) return;
+  dragging = false;
+  const dx = sling.x - rabbit.x;
+  const dy = sling.y - rabbit.y;
+  if (Math.hypot(dx,dy) < 8) {
+    rabbit.x = sling.x;
+    rabbit.y = sling.y;
+    return;
+  }
+  rabbit.vx = dx * POWER;
+  rabbit.vy = dy * POWER;
+  launched = true;
+  shotsLeft--;
+  speechTimer = 1.5;
+  message.textContent = ["Rabbit away!","Let's topple that tower!","Here we go!"][level%3];
+  beep(360,.1,"triangle");
+}
+canvas.addEventListener("pointerup", releaseRabbit);
+canvas.addEventListener("pointercancel", releaseRabbit);
+
+resetButton.addEventListener("click", restart);
+nextButton.addEventListener("click", nextLevel);
+soundButton.addEventListener("click", () => {
+  soundOn = !soundOn;
+  soundButton.textContent = soundOn ? "🔊 Sound: On" : "🔇 Sound: Off";
+});
+
+function spawnParticles(x,y,color,count=8) {
+  for(let i=0;i<count;i++) {
+    particles.push({
+      x,y,vx:rand(-130,130),vy:rand(-190,-25),
+      life:rand(.25,.7),maxLife:.7,
+      size:rand(2,5),color
+    });
+  }
+}
+
+function blockBounds(b) {
+  // Invisible collision box expands as the block rotates.
+  const c = Math.abs(Math.cos(b.angle));
+  const s = Math.abs(Math.sin(b.angle));
+  return {
+    left: b.x-(b.w*c+b.h*s)/2,
+    right: b.x+(b.w*c+b.h*s)/2,
+    top: b.y-(b.h*c+b.w*s)/2,
+    bottom: b.y+(b.h*c+b.w*s)/2
+  };
+}
+
+function overlap(a,b) {
+  const A = blockBounds(a), B = blockBounds(b);
+  const ox = Math.min(A.right,B.right)-Math.max(A.left,B.left);
+  const oy = Math.min(A.bottom,B.bottom)-Math.max(A.top,B.top);
+  if (ox <= 0 || oy <= 0) return null;
+  return {ox,oy};
+}
+
+function applyImpulse(b, ix, iy, hitX, hitY) {
+  if (!b.alive) return;
+  b.vx += ix / b.mass;
+  b.vy += iy / b.mass;
+  const lever = hitX - b.x;
+  b.av += (lever * iy - (hitY-b.y)*ix) / (b.mass*90);
+  b.sleep = 0;
+}
+
+function collideRabbitBlock(b) {
+  const box = blockBounds(b);
+  const cx = clamp(rabbit.x,box.left,box.right);
+  const cy = clamp(rabbit.y,box.top,box.bottom);
+  let dx = rabbit.x-cx, dy = rabbit.y-cy;
+  let d = Math.hypot(dx,dy);
+  if (d >= rabbit.r) return;
+  if (d < .001) {
+    dx = rabbit.vx >= 0 ? -1 : 1;
+    dy = -0.2;
+    d = Math.hypot(dx,dy);
+  }
+  const nx=dx/d, ny=dy/d;
+  const speed = Math.hypot(rabbit.vx,rabbit.vy);
+  if (speed < 20) return;
+
+  const bounce = 1.12;
+  const impulse = speed * rabbit.r * bounce;
+  applyImpulse(b, nx*impulse, ny*impulse, cx, cy);
+
+  // Rabbit bounces too, losing some energy on impact.
+  const dot = rabbit.vx*nx + rabbit.vy*ny;
+  rabbit.vx -= 1.35*dot*nx;
+  rabbit.vy -= 1.35*dot*ny;
+  rabbit.vx *= .72;
+  rabbit.vy *= .72;
+
+  rabbit.x += nx*3;
+  rabbit.y += ny*3;
+  spawnParticles(cx,cy,"#c98b47",7);
+  shake = Math.min(9, shake+3);
+  beep(115,.08,"square",.025);
+}
+
+function collideBlocks(a,b) {
+  if (!a.alive || !b.alive) return;
+  const o = overlap(a,b);
+  if (!o) return;
+
+  // Resolve along the axis with the least overlap.
+  const A = blockBounds(a), B = blockBounds(b);
+  let nx=0, ny=0, depth=0;
+  if (o.ox < o.oy) {
+    nx = a.x < b.x ? -1 : 1;
+    depth = o.ox;
+  } else {
+    ny = a.y < b.y ? -1 : 1;
+    depth = o.oy;
+  }
+
+  const rel = (a.vx-b.vx)*nx + (a.vy-b.vy)*ny;
+  const invA = 1/a.mass, invB = 1/b.mass;
+  const totalInv = invA+invB;
+
+  // Slight overlap correction keeps invisible hitboxes from sticking.
+  const correction = Math.max(0,depth-1)*.62/totalInv;
+  a.x += nx*correction*invA;
+  a.y += ny*correction*invA;
+  b.x -= nx*correction*invB;
+  b.y -= ny*correction*invB;
+
+  if (rel > -8) return;
+
+  // High restitution makes impacts spring into neighboring blocks.
+  const restitution = .66;
+  const impulse = -(1+restitution)*rel/totalInv;
+  const ix = impulse*nx;
+  const iy = impulse*ny;
+  a.vx += ix*invA;
+  a.vy += iy*invA;
+  b.vx -= ix*invB;
+  b.vy -= iy*invB;
+
+  // Off-center collisions make blocks spin and tip.
+  const contactX = (Math.max(A.left,B.left)+Math.min(A.right,B.right))/2;
+  const contactY = (Math.max(A.top,B.top)+Math.min(A.bottom,B.bottom))/2;
+  a.av += ((contactX-a.x)*iy-(contactY-a.y)*ix)/(a.mass*95);
+  b.av -= ((contactX-b.x)*iy-(contactY-b.y)*ix)/(b.mass*95);
+
+  a.sleep=0;
+  b.sleep=0;
+  if (Math.abs(rel)>90) {
+    spawnParticles(contactX,contactY,"#c78a47",3);
+    shake=Math.min(10,shake+1.2);
+    beep(125,.045,"square",.012);
+  }
+}
+
+function update(dt) {
+  elapsed += dt;
+  speechTimer = Math.max(0,speechTimer-dt);
+  shake = Math.max(0,shake-dt*14);
+
+  // Update rabbit.
+  if (launched && rabbit.alive) {
+    rabbit.vy += GRAVITY*dt;
+    rabbit.x += rabbit.vx*dt;
+    rabbit.y += rabbit.vy*dt;
+    rabbit.vx *= Math.pow(.999,dt*60);
+
+    for (const b of blocks) collideRabbitBlock(b);
+
+    for (const h of hawks) {
+      if (!h.alive) continue;
+      const dx=h.x-rabbit.x, dy=h.y-rabbit.y;
+      const d=Math.hypot(dx,dy);
+      if (d < h.r+rabbit.r) {
+        h.alive=false;
+        const speed=Math.hypot(rabbit.vx,rabbit.vy);
+        h.vx=rabbit.vx*.4;
+        h.vy=-Math.abs(rabbit.vy*.35);
+        spawnParticles(h.x,h.y,"#75a54c",14);
+        rabbit.vx*=.78;
+        rabbit.vy*=.78;
+        shake=Math.min(10,shake+3);
+        beep(240,.13,"triangle");
+        message.textContent = ["Got one!","Nice hit!","The hawks are out!"][level%3];
+      }
+    }
+
+    if (rabbit.y > GROUND-rabbit.r) {
+      rabbit.y=GROUND-rabbit.r;
+      if (Math.abs(rabbit.vy)>100) beep(95,.06,"triangle",.018);
+      rabbit.vy *= -.32;
+      rabbit.vx *= .65;
+      if (Math.abs(rabbit.vy)<45) rabbit.vy=0;
+    }
+
+    if (rabbit.x>W+80 || rabbit.y>H+100 ||
+        (Math.hypot(rabbit.vx,rabbit.vy)<25 && elapsed>2.5)) {
+      rabbit.alive=false;
+    }
+  }
+
+  // Block physics.
+  for (const b of blocks) {
+    if (!b.alive) continue;
+    b.vy += GRAVITY*dt;
+    b.x += b.vx*dt;
+    b.y += b.vy*dt;
+    b.angle += b.av*dt;
+
+    b.vx *= Math.pow(.992,dt*60);
+    b.av *= Math.pow(.985,dt*60);
+
+    if (b.y+b.h/2 > GROUND) {
+      const bottom=b.y+b.h/2;
+      b.y -= bottom-GROUND;
+      if (Math.abs(b.vy)>30) {
+        b.vy = -b.vy*.42;
+        b.vx += rand(-7,7);
+        b.av += rand(-.4,.4);
+      } else {
+        b.vy=0;
+        b.vx*=.88;
+        b.av*=.84;
+      }
+    }
+
+    if (b.x-b.w/2 < 0) {
+      b.x=b.w/2;
+      b.vx=Math.abs(b.vx)*.45;
+    }
+    if (b.x+b.w/2 > W) {
+      b.x=W-b.w/2;
+      b.vx=-Math.abs(b.vx)*.45;
+    }
+
+    if (Math.abs(b.vx)<3 && Math.abs(b.vy)<5 &&
+        Math.abs(b.av)<.05 && b.y+b.h/2>=GROUND-2) {
+      b.sleep+=dt;
+    } else {
+      b.sleep=0;
+    }
+  }
+
+  // Multiple passes allow a single collision to create chain reactions.
+  for (let pass=0;pass<3;pass++) {
+    for (let i=0;i<blocks.length;i++) {
+      for (let j=i+1;j<blocks.length;j++) {
+        collideBlocks(blocks[i],blocks[j]);
+      }
+    }
+  }
+
+  // Hawks can fall when their supports are knocked away.
+  for (const h of hawks) {
+    if (!h.alive) continue;
+    const supported = blocks.some(b => {
+      if (!b.alive) return false;
+      const box=blockBounds(b);
+      return h.x+h.r>box.left && h.x-h.r<box.right &&
+             Math.abs((h.y+h.r)-box.top)<9 &&
+             Math.abs(b.vy)<35;
+    });
+
+    h.vy += GRAVITY*dt;
+    h.x += h.vx*dt;
+    h.y += h.vy*dt;
+    h.vx *= Math.pow(.985,dt*60);
+
+    if (h.y+h.r>=GROUND) {
+      h.y=GROUND-h.r;
+      h.vy=0;
+      h.vx*=.8;
+      h.grounded=true;
+    } else if (supported && h.vy>0) {
+      h.vy=0;
+      h.grounded=true;
+    } else {
+      h.grounded=false;
+    }
+
+    if (h.x < -40 || h.x > W+40 || h.y > H+50) h.alive=false;
+  }
+
+  // Remove blocks that have been flung far outside the level.
+  for (const b of blocks) {
+    if (b.x < -150 || b.x > W+150 || b.y > H+150) b.alive=false;
+  }
+
+  particles = particles.filter(p=>p.life>0);
+  for(const p of particles) {
+    p.life-=dt;
+    p.vy+=GRAVITY*.55*dt;
+    p.x+=p.vx*dt;
+    p.y+=p.vy*dt;
+  }
+
+  const remaining=hawks.filter(h=>h.alive).length;
+  const activeBlocks=blocks.filter(b=>b.alive).length;
+
+  if (!won && remaining===0) {
+    won=true;
+    nextButton.hidden=false;
+    message.textContent = level===TOTAL_LEVELS
+      ? "🏆 You beat all 50 levels! Amazing!"
+      : "🥕 Level cleared! Great chain reactions!";
+    beep(520,.18,"triangle");
+    setTimeout(()=>beep(680,.2,"triangle"),150);
+  } else if (!won && !lost && !rabbit.alive && !dragging && !launched) {
+    // Waiting to aim; do nothing.
+  } else if (!won && !lost && !rabbit.alive && launched &&
+             (elapsed>3.5 || activeBlocks===0)) {
+    if (shotsLeft>0) {
+      launched=false;
+      rabbit={x:sling.x,y:sling.y,r:16,vx:0,vy:0,alive:true,grounded:false};
+      message.textContent="Pull back and try another shot!";
+    } else {
+      lost=true;
+      message.textContent="Try again! Restart this level.";
+    }
+  }
+
+  // If a rabbit is still moving or a tower is falling, give physics time.
+  if (launched && !rabbit.alive && elapsed>3.5 && shotsLeft>0) {
+    launched=false;
+    rabbit={x:sling.x,y:sling.y,r:16,vx:0,vy:0,alive:true,grounded:false};
+    message.textContent="Your next rabbit is ready!";
+  }
+
+  updateInfo();
+}
+
+function drawBackground() {
+  const sky=ctx.createLinearGradient(0,0,0,H);
+  sky.addColorStop(0,"#79c9f5");
+  sky.addColorStop(1,"#d9f5ff");
+  ctx.fillStyle=sky;
+  ctx.fillRect(0,0,W,H);
+
+  // Sun.
+  ctx.fillStyle="#ffdf63";
+  ctx.beginPath(); ctx.arc(820,78,35,0,Math.PI*2); ctx.fill();
+
+  // Clouds.
+  for (const c of [
+    [110,90,1],[365,72,.75],[675,145,.85]
+  ]) {
+    ctx.save();
+    ctx.translate(c[0],c[1]); ctx.scale(c[2],c[2]);
+    ctx.fillStyle="rgba(255,255,255,.88)";
+    ctx.beginPath();
+    ctx.arc(0,10,20,0,Math.PI*2);
+    ctx.arc(25,0,26,0,Math.PI*2);
+    ctx.arc(52,12,19,0,Math.PI*2);
+    ctx.fill();
+    ctx.restore();
+  }
+
+  // Hills.
+  ctx.fillStyle="#83c96d";
+  ctx.beginPath();
+  ctx.moveTo(0,390);
+  ctx.quadraticCurveTo(150,280,300,390);
+  ctx.quadraticCurveTo(480,300,640,390);
+  ctx.quadraticCurveTo(810,270,960,380);
+  ctx.lineTo(960,500); ctx.lineTo(0,500); ctx.fill();
+
+  ctx.fillStyle="#5aaf50";
+  ctx.beginPath();
+  ctx.moveTo(0,430);
+  ctx.quadraticCurveTo(240,350,450,435);
+  ctx.quadraticCurveTo(700,350,960,420);
+  ctx.lineTo(960,500); ctx.lineTo(0,500); ctx.fill();
+
+  // Ground.
+  ctx.fillStyle="#4b9e3d";
+  ctx.fillRect(0,GROUND,W,H-GROUND);
+  ctx.fillStyle="#76c94c";
+  ctx.fillRect(0,GROUND,W,10);
+
+  // Small grass blades.
+  ctx.strokeStyle="#348b36";
+  ctx.lineWidth=2;
+  for(let x=0;x<W;x+=22) {
+    ctx.beginPath();
+    ctx.moveTo(x,GROUND+8);
+    ctx.lineTo(x+rand(-4,4),GROUND+rand(1,10));
+    ctx.stroke();
+  }
+}
+
+function drawBlock(b) {
+  if (!b.alive) return;
+  ctx.save();
+  ctx.translate(b.x,b.y);
+  ctx.rotate(b.angle);
+
+  // Invisible hitbox is not drawn. These rectangles are only artwork.
+  if (b.kind==="beam") {
+    ctx.fillStyle="#c88a4a";
+    ctx.strokeStyle="#80512b";
+  } else {
+    ctx.fillStyle="#b77a3d";
+    ctx.strokeStyle="#75451f";
+  }
+  ctx.lineWidth=2;
+  ctx.fillRect(-b.w/2,-b.h/2,b.w,b.h);
+  ctx.strokeRect(-b.w/2,-b.h/2,b.w,b.h);
+
+  // Wood grain.
+  ctx.strokeStyle="rgba(255,226,164,.5)";
+  ctx.lineWidth=1.5;
+  for(let i=-1;i<=1;i++) {
+    if(b.w>b.h) {
+      ctx.beginPath();
+      ctx.moveTo(-b.w/2+4,i*b.h*.22);
+      ctx.lineTo(b.w/2-4,i*b.h*.22);
+      ctx.stroke();
+    } else {
+      ctx.beginPath();
+      ctx.moveTo(i*b.w*.22,-b.h/2+4);
+      ctx.lineTo(i*b.w*.22,b.h/2-4);
+      ctx.stroke();
+    }
+  }
+  ctx.restore();
+}
+
+function drawHawk(h) {
+  if (!h.alive) return;
+  ctx.save();
+  ctx.translate(h.x,h.y);
+  h.flap+=.08;
+  const flap=Math.sin(h.flap)*4;
+
+  ctx.fillStyle="#5e4937";
+  ctx.beginPath();
+  ctx.ellipse(-10,-4,12,6+flap*.3,-.3,0,Math.PI*2);
+  ctx.ellipse(10,-4,12,6-flap*.3,.3,0,Math.PI*2);
+  ctx.fill();
+
+  ctx.fillStyle="#8a6847";
+  ctx.beginPath(); ctx.arc(0,0,h.r,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#c29a69";
+  ctx.beginPath(); ctx.arc(0,4,9,0,Math.PI*2); ctx.fill();
+
+  ctx.fillStyle="#fff";
+  ctx.beginPath(); ctx.arc(5,-4,4,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#111";
+  ctx.beginPath(); ctx.arc(6,-4,1.8,0,Math.PI*2); ctx.fill();
+
+  ctx.fillStyle="#f3c13b";
+  ctx.beginPath();
+  ctx.moveTo(12,0); ctx.lineTo(23,4); ctx.lineTo(12,8); ctx.closePath();
+  ctx.fill();
+  ctx.restore();
+}
+
+function drawRabbit() {
+  if (!rabbit || !rabbit.alive) return;
+  ctx.save();
+  ctx.translate(rabbit.x,rabbit.y);
+  const angle=launched ? Math.atan2(rabbit.vy,rabbit.vx)*.15 : 0;
+  ctx.rotate(angle);
+
+  // Ears.
+  ctx.fillStyle="#f4f0e8";
+  ctx.beginPath();
+  ctx.ellipse(-7,-18,5,15,-.2,0,Math.PI*2);
+  ctx.ellipse(5,-20,5,16,.18,0,Math.PI*2);
+  ctx.fill();
+  ctx.fillStyle="#e99aab";
+  ctx.beginPath();
+  ctx.ellipse(-7,-19,2,10,-.2,0,Math.PI*2);
+  ctx.ellipse(5,-21,2,11,.18,0,Math.PI*2);
+  ctx.fill();
+
+  // Body and face.
+  ctx.fillStyle="#f4f0e8";
+  ctx.beginPath(); ctx.arc(0,0,16,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#fff";
+  ctx.beginPath(); ctx.arc(6,4,7,0,Math.PI*2); ctx.fill();
+
+  ctx.fillStyle="#222";
+  ctx.beginPath(); ctx.arc(5,-4,2.2,0,Math.PI*2); ctx.fill();
+  ctx.fillStyle="#ee8eaa";
+  ctx.beginPath(); ctx.arc(12,3,3,0,Math.PI*2); ctx.fill();
+
+  ctx.strokeStyle="#555";
+  ctx.lineWidth=1.5;
+  ctx.beginPath(); ctx.moveTo(6,8); ctx.quadraticCurveTo(9,11,12,8); ctx.stroke();
+  ctx.restore();
+}
+
+function drawSlingshot() {
+  // Back wooden post.
+  ctx.strokeStyle="#69401e";
+  ctx.lineWidth=12;
+  ctx.lineCap="round";
+  ctx.beginPath();
+  ctx.moveTo(sling.x-3,GROUND);
+  ctx.lineTo(sling.x, sling.y-26);
+  ctx.lineTo(sling.x-12,sling.y-42);
+  ctx.stroke();
+
+  // Front post.
+  ctx.strokeStyle="#805027";
+  ctx.lineWidth=10;
+  ctx.beginPath();
+  ctx.moveTo(sling.x+10,GROUND);
+  ctx.lineTo(sling.x+4,sling.y-25);
+  ctx.lineTo(sling.x+14,sling.y-43);
+  ctx.stroke();
+
+  // Elastic band while aiming.
+  if (!launched && rabbit && rabbit.alive) {
+    ctx.strokeStyle="#563321";
+    ctx.lineWidth=4;
+    ctx.beginPath();
+    ctx.moveTo(sling.x-12,sling.y-41);
+    ctx.lineTo(rabbit.x,rabbit.y);
+    ctx.lineTo(sling.x+14,sling.y-43);
+    ctx.stroke();
+  }
+}
+
+function drawAim() {
+  if (!dragging || launched || !rabbit.alive) return;
+  const vx=(sling.x-rabbit.x)*POWER;
+  const vy=(sling.y-rabbit.y)*POWER;
+
+  ctx.fillStyle="rgba(255,255,255,.9)";
+  for(let t=.1;t<5.5;t+=.19) {
+    const x=sling.x+vx*t;
+    const y=sling.y+vy*t+.5*GRAVITY*t*t;
+    if(y>GROUND || x>W) break;
+    ctx.beginPath();
+    ctx.arc(x,y,2.4,0,Math.PI*2);
+    ctx.fill();
+  }
+}
+
+function drawParticles() {
+  for(const p of particles) {
+    ctx.globalAlpha=clamp(p.life/p.maxLife,0,1);
+    ctx.fillStyle=p.color;
+    ctx.fillRect(p.x,p.y,p.size,p.size);
+  }
+  ctx.globalAlpha=1;
+}
+
+function draw() {
+  ctx.save();
+  if(shake>0) ctx.translate(rand(-shake,shake),rand(-shake,shake));
+
+  drawBackground();
+
+  // Distant scenery trees.
+  for(const x of [35,315,935]) {
+    ctx.fillStyle="#79502d";
+    ctx.fillRect(x,GROUND-38,8,38);
+    ctx.fillStyle="#398b45";
+    ctx.beginPath(); ctx.arc(x+4,GROUND-46,22,0,Math.PI*2); ctx.fill();
+  }
+
+  // Draw blocks from back to front.
+  for(const b of blocks) drawBlock(b);
+  for(const h of hawks) drawHawk(h);
+
+  drawSlingshot();
+  drawAim();
+  drawRabbit();
+  drawParticles();
+
+  if(won || lost) {
+    ctx.fillStyle="rgba(12,28,40,.55)";
+    ctx.fillRect(0,0,W,H);
+    ctx.textAlign="center";
+    ctx.fillStyle="#fff";
+    ctx.font="bold 38px Arial";
+    ctx.fillText(won ? (level===TOTAL_LEVELS?"ALL 50 LEVELS!":"LEVEL CLEARED!") : "TRY AGAIN!",W/2,H/2-5);
+    ctx.font="20px Arial";
+    ctx.fillText(won ? "Great job!" : "Restart this level to try again",W/2,H/2+32);
+  }
+
+  ctx.restore();
+}
+
+function frame(timestamp) {
+  const dt=Math.min(.025,(timestamp-(lastTime||timestamp))/1000);
+  lastTime=timestamp;
+  update(dt);
+  draw();
+  requestAnimationFrame(frame);
+}
+
+createLevel(level);
+requestAnimationFrame(frame);
+})();
+</script>
+</body>
+</html>
